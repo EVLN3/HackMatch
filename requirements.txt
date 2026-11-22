@@ -1,0 +1,4 @@
+discord.py==2.7.1
+python-dotenv==1.2.4
+networkx==3.7
+pytest==9.2.0
