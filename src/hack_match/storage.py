@@ -28,9 +28,15 @@ def connect(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
         "  user_id INTEGER NOT NULL,"
         "  guild_id INTEGER NOT NULL,"
         "  answers TEXT NOT NULL,"
+        "  preadded_teammates TEXT NOT NULL DEFAULT '',"
         "  PRIMARY KEY (user_id, guild_id)"
         ")"
     )
+    try:
+        # Migration for a DB created before preadded_teammates existed.
+        conn.execute("ALTER TABLE profiles ADD COLUMN preadded_teammates TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.execute(
         "CREATE TABLE IF NOT EXISTS bot_state ("
         "  key TEXT NOT NULL,"
@@ -68,22 +74,32 @@ def connect(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     return conn
 
 
+def _parse_preadded(csv: str) -> list[int]:
+    return [int(uid) for uid in csv.split(",") if uid]
+
+
 def save_profile(conn: sqlite3.Connection, profile: Profile, guild_id: int) -> None:
+    preadded_csv = ",".join(str(uid) for uid in profile.preadded_teammate_ids)
     conn.execute(
-        "INSERT INTO profiles (user_id, guild_id, answers) VALUES (?, ?, ?) "
-        "ON CONFLICT(user_id, guild_id) DO UPDATE SET answers = excluded.answers",
-        (profile.user_id, guild_id, json.dumps(profile.answers)),
+        "INSERT INTO profiles (user_id, guild_id, answers, preadded_teammates) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(user_id, guild_id) DO UPDATE SET "
+        "answers = excluded.answers, preadded_teammates = excluded.preadded_teammates",
+        (profile.user_id, guild_id, json.dumps(profile.answers), preadded_csv),
     )
     conn.commit()
 
 
 def load_profile(conn: sqlite3.Connection, user_id: int, guild_id: int) -> Profile | None:
     row = conn.execute(
-        "SELECT answers FROM profiles WHERE user_id = ? AND guild_id = ?", (user_id, guild_id)
+        "SELECT answers, preadded_teammates FROM profiles WHERE user_id = ? AND guild_id = ?",
+        (user_id, guild_id),
     ).fetchone()
     if row is None:
         return None
-    return Profile(user_id=user_id, answers=json.loads(row[0]))
+    answers_json, preadded_csv = row
+    return Profile(
+        user_id=user_id, answers=json.loads(answers_json), preadded_teammate_ids=_parse_preadded(preadded_csv)
+    )
 
 
 def get_guilds_for_user(conn: sqlite3.Connection, user_id: int) -> list[int]:
@@ -95,9 +111,12 @@ def get_guilds_for_user(conn: sqlite3.Connection, user_id: int) -> list[int]:
 
 def load_all_profiles(conn: sqlite3.Connection, guild_id: int) -> list[Profile]:
     rows = conn.execute(
-        "SELECT user_id, answers FROM profiles WHERE guild_id = ?", (guild_id,)
+        "SELECT user_id, answers, preadded_teammates FROM profiles WHERE guild_id = ?", (guild_id,)
     ).fetchall()
-    return [Profile(user_id=uid, answers=json.loads(answers)) for uid, answers in rows]
+    return [
+        Profile(user_id=uid, answers=json.loads(answers), preadded_teammate_ids=_parse_preadded(preadded_csv))
+        for uid, answers, preadded_csv in rows
+    ]
 
 
 def has_matching_run(conn: sqlite3.Connection, guild_id: int) -> bool:
@@ -203,7 +222,11 @@ def leave_team(conn: sqlite3.Connection, user_id: int, guild_id: int) -> list[in
 
 def load_teams_with_capacity(conn: sqlite3.Connection, guild_id: int, max_size: int) -> list[list[Profile]]:
     """This server's signed-up profiles grouped by current team, excluding
-    teams already at max_size."""
+    teams already at max_size. A team member who was preadded by a teammate
+    (see Profile.preadded_teammate_ids) but never filled out the quiz
+    themselves is included as a placeholder (Profile.is_preadded_placeholder),
+    so team size/capacity and display both still account for them even
+    though they have no answers of their own."""
     profiles = load_all_profiles(conn, guild_id)
     profiles_by_id = {p.user_id: p for p in profiles}
     seen: set[int] = set()
@@ -214,7 +237,13 @@ def load_teams_with_capacity(conn: sqlite3.Connection, guild_id: int, max_size: 
         member_ids = get_team_members(conn, profile.user_id, guild_id)
         seen.update(member_ids)
         if len(member_ids) < max_size:
-            teams.append([profiles_by_id[uid] for uid in member_ids if uid in profiles_by_id])
+            real = [profiles_by_id[uid] for uid in member_ids if uid in profiles_by_id]
+            placeholders = [
+                Profile(user_id=uid, is_preadded_placeholder=True)
+                for uid in member_ids
+                if uid not in profiles_by_id
+            ]
+            teams.append(real + placeholders)
     return teams
 
 

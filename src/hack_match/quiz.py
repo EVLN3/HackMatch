@@ -184,3 +184,10 @@ QUESTIONS_BY_ID: dict[str, Question] = {q.id: q for q in QUESTIONS}
 class Profile:
     user_id: int
     answers: dict[str, str | list[str]] = field(default_factory=dict)
+    # Teammates this person already has (entered at quiz-start, not via the
+    # quiz questions above) who haven't filled out the quiz themselves.
+    preadded_teammate_ids: list[int] = field(default_factory=list)
+    # True for a synthesized stand-in (see storage.load_teams_with_capacity)
+    # representing one of the above inside a team's member list — never a
+    # real signup, so it has no answers of its own.
+    is_preadded_placeholder: bool = False

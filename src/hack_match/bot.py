@@ -81,11 +81,23 @@ def _summary_text(answers: dict[str, str | list[str]]) -> str:
 
 
 def _save_and_show_summary(
-    user_id: int, guild_id: int, answers: dict[str, str | list[str]]
+    user_id: int, guild_id: int, answers: dict[str, str | list[str]], preadded_ids: list[int] | None = None
 ) -> tuple[str, "SummaryView"]:
     conn = storage.connect()
-    storage.save_profile(conn, Profile(user_id=user_id, answers=answers), guild_id)
-    return _summary_text(answers), SummaryView(user_id, guild_id, answers)
+    if preadded_ids is None:
+        # Not passed by an edit-one-answer flow (which doesn't track this) --
+        # keep whatever was already on file instead of wiping it out.
+        existing = storage.load_profile(conn, user_id, guild_id)
+        preadded_ids = existing.preadded_teammate_ids if existing else []
+    storage.save_profile(
+        conn, Profile(user_id=user_id, answers=answers, preadded_teammate_ids=preadded_ids), guild_id
+    )
+    content = _summary_text(answers)
+    if preadded_ids:
+        storage.merge_teams(conn, [user_id] + preadded_ids, guild_id)
+        mentions = " ".join(f"<@{uid}>" for uid in preadded_ids)
+        content = f"Your team already includes {mentions}.\n\n{content}"
+    return content, SummaryView(user_id, guild_id, answers)
 
 
 class SummaryView(discord.ui.View):
@@ -322,6 +334,73 @@ class GuildPickerView(discord.ui.View):
         return callback
 
 
+class TeammateCountView(discord.ui.View):
+    """First step of /quiz: how many teammates does this person already have
+    who won't be filling out the quiz themselves? Lets a pre-formed group
+    sign up as a team from just one person's answers."""
+
+    def __init__(self, user_id: int, guild_id: int) -> None:
+        super().__init__(timeout=600)
+        self.user_id = user_id
+        self.guild_id = guild_id
+        for count in (0, 1, 2):
+            button = discord.ui.Button(label=str(count), style=discord.ButtonStyle.secondary)
+            button.callback = self._make_callback(count)
+            self.add_item(button)
+
+    def _make_callback(self, count: int):
+        async def callback(interaction: discord.Interaction) -> None:
+            if interaction.user.id != self.user_id:
+                await interaction.response.send_message("This quiz isn't yours.", ephemeral=True)
+                return
+            if count == 0:
+                await _ask_question(
+                    interaction, self.user_id, self.guild_id, 0, {}, is_initial=False, preadded_ids=[]
+                )
+                return
+            await interaction.response.send_modal(PreaddedTeammatesModal(self.user_id, self.guild_id))
+
+        return callback
+
+
+class PreaddedTeammatesModal(discord.ui.Modal, title="Your existing teammates"):
+    """Collects Discord user IDs for teammates the person already has.
+    Always offers 3 boxes (1 required, 2 optional) regardless of whether they
+    said 1 or 2 above — simplest way to let them fill in exactly as many as
+    they actually have."""
+
+    teammate_1 = discord.ui.TextInput(label="Teammate's Discord user ID", max_length=25)
+    teammate_2 = discord.ui.TextInput(
+        label="2nd teammate's Discord user ID (optional)", required=False, max_length=25
+    )
+    teammate_3 = discord.ui.TextInput(
+        label="3rd teammate's Discord user ID (optional)", required=False, max_length=25
+    )
+
+    def __init__(self, user_id: int, guild_id: int) -> None:
+        super().__init__()
+        self.user_id = user_id
+        self.guild_id = guild_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        preadded_ids: list[int] = []
+        for box in (self.teammate_1, self.teammate_2, self.teammate_3):
+            raw = box.value.strip()
+            if not raw:
+                continue
+            if not raw.isdigit():
+                await interaction.response.send_message(
+                    f"'{raw}' isn't a valid Discord user ID (numbers only — with Developer Mode on, "
+                    "right-click their name and Copy User ID).",
+                    ephemeral=True,
+                )
+                return
+            preadded_ids.append(int(raw))
+        await _ask_question(
+            interaction, self.user_id, self.guild_id, 0, {}, is_initial=False, preadded_ids=preadded_ids
+        )
+
+
 async def _require_guild(interaction: discord.Interaction) -> bool:
     """False (after replying with an error) if this command was run somewhere
     with no server context (a DM, or a user-installed context) — every
@@ -341,15 +420,19 @@ async def _ask_question(
     index: int,
     answers: dict[str, str | list[str]],
     is_initial: bool,
+    preadded_ids: list[int] | None = None,
 ) -> None:
     question = QUESTIONS[index]
 
     async def on_answered(answer_interaction: discord.Interaction, value: str | list[str]) -> None:
         answers[question.id] = value
         if index + 1 < len(QUESTIONS):
-            await _ask_question(answer_interaction, user_id, guild_id, index + 1, answers, is_initial=False)
+            await _ask_question(
+                answer_interaction, user_id, guild_id, index + 1, answers, is_initial=False,
+                preadded_ids=preadded_ids,
+            )
         else:
-            content, view = _save_and_show_summary(user_id, guild_id, answers)
+            content, view = _save_and_show_summary(user_id, guild_id, answers, preadded_ids)
             await answer_interaction.response.edit_message(
                 content=f"You're signed up! {content}", view=view
             )
@@ -399,7 +482,10 @@ def create_client(signup_deadline: datetime, dev_guild_id: int | None = None) ->
                 "Signups are closed — matching has already run.", ephemeral=True
             )
             return
-        await _ask_question(interaction, interaction.user.id, interaction.guild_id, 0, {}, is_initial=True)
+        view = TeammateCountView(interaction.user.id, interaction.guild_id)
+        await interaction.response.send_message(
+            "How many other teammate(s) do you already have on your team?", view=view, ephemeral=True
+        )
 
     @tree.command(name="unpair", description="Leave your current team and go back to searching solo")
     async def unpair(interaction: discord.Interaction) -> None:
@@ -625,8 +711,14 @@ def create_client(signup_deadline: datetime, dev_guild_id: int | None = None) ->
             return
 
         storage.record_team_approval(conn, reactor_id, guild_id, candidate_key)
-        own_fully_approved = storage.team_fully_approved(conn, own_members, guild_id, candidate_key)
-        candidate_fully_approved = storage.team_fully_approved(conn, candidate_members, guild_id, own_team_key)
+        # Teammates preadded by someone else (never filled out /quiz themselves)
+        # never get sent a proposal to react to, so don't require their approval.
+        own_approvers = [uid for uid in own_members if storage.load_profile(conn, uid, guild_id) is not None]
+        candidate_approvers = [
+            uid for uid in candidate_members if storage.load_profile(conn, uid, guild_id) is not None
+        ]
+        own_fully_approved = storage.team_fully_approved(conn, own_approvers, guild_id, candidate_key)
+        candidate_fully_approved = storage.team_fully_approved(conn, candidate_approvers, guild_id, own_team_key)
 
         if own_fully_approved and candidate_fully_approved:
             new_members = own_members + candidate_members
@@ -689,44 +781,52 @@ async def _team_candidate_embed(
     guild_name: str,
     is_best_match: bool = False,
 ) -> discord.Embed:
-    names = []
+    # No title -- Discord embed titles can't render mentions as clickable, so
+    # every person's name only ever appears as a mention, in the description
+    # or a field's value (both of which do render mentions as clickable).
+    mentions = []
     for member in candidate_team:
+        if member.is_preadded_placeholder:
+            mentions.append(f"<@{member.user_id}>")
+            continue
         try:
             member_user = await client.fetch_user(member.user_id)
-            names.append(member_user.display_name)
+            mentions.append(member_user.mention)
         except discord.NotFound:
-            names.append(f"(left the server: {member.user_id})")
+            mentions.append(f"(left the server: {member.user_id})")
 
-    title_people = " & ".join(names)
-    title = title_people if is_best_match else f"Potential teammate(s): {title_people}"
+    mention_people = ", ".join(mentions)
     color, status_text = _status_color_and_text(len(candidate_team))
     description_lines = (
-        [f"## {guild_name}", f"\U0001f31f Your best match: {title_people}"] if is_best_match else []
+        [f"## {guild_name}", f"\U0001f31f Your best match: {mention_people}"] if is_best_match else []
     )
     description_lines += [f"Compatibility: {score:.0%}", status_text]
-    embed = discord.Embed(title=title, description="\n".join(description_lines), color=color)
+    embed = discord.Embed(description="\n".join(description_lines), color=color)
 
     # Show full detail for just one representative member (avoids a wall of
     # repeated fields for bigger teams); the rest are named, not spelled out.
     # Nothing is removed from storage — this only trims what's displayed here.
-    primary_member, primary_name = candidate_team[0], names[0]
-    lines = [
+    primary_member, primary_mention = candidate_team[0], mentions[0]
+    lines = [primary_mention] + [
         f"**{q.text}** {_format_answer(primary_member.answers[q.id])}"
         for q in QUESTIONS
         if q.id in primary_member.answers and not q.free_text
     ]
-    embed.add_field(name=primary_name, value="\n".join(lines) or "No answers", inline=False)
+    embed.add_field(name="Contact", value="\n".join(lines), inline=False)
 
-    other_members = list(zip(candidate_team[1:], names[1:]))
+    other_members = list(zip(candidate_team[1:], mentions[1:]))
     if other_members:
         teammate_lines = []
-        for member, name in other_members:
+        for member, mention in other_members:
+            if member.is_preadded_placeholder:
+                teammate_lines.append(f"{mention} (already on this team)")
+                continue
             summary = ", ".join(
                 _format_answer(member.answers[q.id])
                 for q in QUESTIONS
                 if q.id in member.answers and not q.free_text
             )
-            teammate_lines.append(f"**{name}**: {summary}" if summary else f"**{name}**: No answers")
+            teammate_lines.append(f"{mention}: {summary}" if summary else f"{mention}: No answers")
         embed.add_field(name="Also on this team", value="\n".join(teammate_lines), inline=False)
 
     return embed
@@ -791,6 +891,8 @@ async def _post_candidates_for_team(
             client, candidate_team, score, guild_name, is_best_match=candidate_team_id == best_id
         )
         for member in team:
+            if member.is_preadded_placeholder:
+                continue  # never signed up themselves; can't react to approve
             try:
                 user = await client.fetch_user(member.user_id)
                 message = await user.send(embed=embed)
@@ -808,6 +910,8 @@ async def _post_candidates_for_team(
             client, team, score, guild_name, is_best_match=reciprocal_is_best
         )
         for member in candidate_team:
+            if member.is_preadded_placeholder:
+                continue  # never signed up themselves; can't react to approve
             try:
                 user = await client.fetch_user(member.user_id)
                 message = await user.send(embed=reciprocal_embed)
