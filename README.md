@@ -9,9 +9,9 @@ Finding teammates at hackathons is often stressful, inefficient, and time-consum
 HackMatch is a teammate finder built in Discord, the communication platform used by most hackathons. Participants complete a short quiz containing the same information typically found in a #find-a-team post, such as technical skills, interests, goals, preferred team size, and level of competitiveness. Our matching algorithm then quantifies these responses and identifies the most compatible teammates based on complementary skills and shared objectives, helping users form stronger teams faster.
 
 ## How we built it
-• Claude Sonnet 5: Leveraged agentic AI as a learning experience to power the solution.
-• Python: Used for data processing, modelling, and developing the compatibility scoring algorithm.
-• Discord Developer Portal: Created and configured a Discord bot for seamless integration into hackathon servers.
+* Claude Sonnet 5: Leveraged agentic AI as a learning experience to power the solution.
+* Python: Used for data processing, modelling, and developing the compatibility scoring algorithm.
+* Discord Developer Portal: Created and configured a Discord bot for seamless integration into hackathon servers.
 
 ## Challenges we ran into
 This was our first time building an application for Discord, so we faced a steep learning curve when working on Discord Developer Portal. Another challenge was designing a matching algorithm that could accurately represent human preferences and team compatibility using numerical scores. Balancing complementary skills with shared interests while keeping the system fair and intuitive required several iterations and adjustments.
