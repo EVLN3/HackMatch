@@ -1,5 +1,5 @@
 # CodeJam2026
-# Our Project
+# Our Project: HackMatch
 HackMatch is a Discord bot teammate matching platform designed specifically for hackathons. Instead of scrolling through dozens of #find-a-team posts and cold-DMing strangers, participants complete a short quiz and are matched with the most compatible teammates based on skills, goals, interests, and team preferences. 
 
 ## Inspiration
