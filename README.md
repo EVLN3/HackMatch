@@ -1,4 +1,3 @@
-# CodeJam2026
 # Access below: 
 https://discord.com/oauth2/authorize?client_id=1573512196732751972&permissions=2048&integration_type=0&scope=bot+applications.commands
 
